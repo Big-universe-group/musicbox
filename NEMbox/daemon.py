@@ -130,6 +130,7 @@ class MusicboxDaemon:
         self.api = NetEase()
         self.player = Player(ui=NullUi())
         self.player.end_callback = None
+        self._cookie_mtime = self._read_cookie_mtime()
         self._lock_fd: int | None = None
         self._server: socket.socket | None = None
         self._running = False
@@ -247,7 +248,29 @@ class MusicboxDaemon:
         with contextlib.suppress(OSError):
             conn.sendall(json.dumps(response, ensure_ascii=False).encode() + b"\n")
 
+    def _read_cookie_mtime(self) -> int | None:
+        try:
+            return os.stat(self.storage.cookie_path).st_mtime_ns
+        except OSError:
+            return None
+
+    def _sync_cookies(self) -> None:
+        """登录 / 登出由别的 CLI 进程完成、只改 cookie 文件；daemon 不重读就一直用
+        启动时的身份取播放链接（未登录时 VIP 歌只给 30 秒试听链接）。"""
+        mtime = self._read_cookie_mtime()
+        if mtime == self._cookie_mtime:
+            return
+        self._cookie_mtime = mtime
+        log.info("cookie file changed, reloading login state")
+        self.api.reload_cookies()
+        self.player.api.reload_cookies()
+        if not self.player.is_empty:
+            # 队列里旧身份取的链接一并换掉；当前这首照常放完，不触发重播
+            self.player.refresh_urls()
+            self.player.refresh_url_flag = False
+
     def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        self._sync_cookies()
         handlers = {
             "daemon.ping": lambda: {"pid": os.getpid()},
             "daemon.shutdown": self._shutdown,

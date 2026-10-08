@@ -399,6 +399,15 @@ class NetEase:
             if morsel.value:
                 self._set_cookie(name, morsel.value)
 
+    def reload_cookies(self):
+        """重读 cookie 文件：登录 / 登出可能在别的进程（CLI）里完成，常驻进程要跟上。"""
+        self.cookie_jar.clear()
+        try:
+            self.cookie_jar.load()
+        except FileNotFoundError:
+            return
+        self._device_id = self._get_cookie_value("deviceId") or self._device_id
+
     def fetch_toplists(self):
         try:
             with self.session.cache_disabled():
@@ -684,6 +693,17 @@ class NetEase:
         path = "/weapi/user/playlist"
         params = {"uid": uid, "offset": offset, "limit": limit}
         return self.request("POST", path, params).get("playlist", [])
+
+    # 最近播放的歌曲（需登录，接口最多 300 首；服务端忽略 limit，本地截断）
+    def recent_songs(self, limit=100):
+        path = "/weapi/play-record/song/list"
+        data = self.request("POST", path, {"limit": limit}).get("data") or {}
+        songs = [
+            item["data"]
+            for item in data.get("list") or []
+            if isinstance(item.get("data"), dict) and item["data"].get("id")
+        ]
+        return songs[:limit]
 
     # 我的云盘
     def user_cloud(self, offset=0, limit=100):

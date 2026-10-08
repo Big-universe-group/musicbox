@@ -65,6 +65,22 @@ def test_daemon_volume_delta_when_stopped(runtime_paths):
     assert result["volume"] == 60
 
 
+def test_daemon_reloads_cookies_once_after_external_login(runtime_paths):
+    """CLI 登录只改 cookie 文件；daemon 要在下一次请求时重读，且只重读一次。"""
+    daemon = MusicboxDaemon()
+    calls = []
+    daemon.api.reload_cookies = lambda: calls.append("api")
+    daemon.player.api.reload_cookies = lambda: calls.append("player")
+
+    daemon._dispatch("player.status", {})
+    assert calls == []
+
+    daemon._cookie_mtime = -1  # 模拟别的进程改写了 cookie 文件
+    daemon._dispatch("player.status", {})
+    daemon._dispatch("player.status", {})
+    assert calls == ["api", "player"]
+
+
 def test_daemon_rpc_ping_status_and_shutdown(runtime_paths):
     daemon = MusicboxDaemon()
     errors: list[BaseException] = []

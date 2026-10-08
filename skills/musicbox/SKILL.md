@@ -26,8 +26,8 @@ description: Use when the user wants to play/pause/skip music, control volume, s
 | 队列 | `queue list` / `queue add <id...>` / `queue play <index>` / `queue clear --yes` |
 | 守护进程 | `daemon start\|stop\|status\|restart` |
 | 搜索 | `search <keyword> --type song\|artist\|album\|playlist\|dj` |
-| 歌曲/歌单 | `song info <id>` / `song url <id> [--quality lossless]` / `playlist show <id>` |
-| 榜单/推荐 | `toplist [--index n]` / `recommend songs\|playlists`（需登录） / `fm`（需登录） |
+| 歌曲/歌单 | `song info <id>` / `song url <id> [--quality lossless]` / `playlist show <id>` / `playlist mine`（需登录，我喜欢 / 创建 / 收藏，`data[].kind` 为 `liked\|created\|subscribed`） |
+| 榜单/推荐 | `toplist [--index n]` / `recommend songs\|playlists`（需登录） / `fm`（需登录） / `recent [--limit n]`（最近播放，需登录，上限 300） |
 | 评论/喜爱 | `comments <id>` / `like <id>`（需登录） |
 | 查询歌手/专辑 | `artist <id>` / `album <id>` |
 | 下载 | `download --artist/--album/--songs/--playlist` |

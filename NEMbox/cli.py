@@ -12,7 +12,7 @@ from typing import Any
 import requests
 
 from . import __version__
-from .api import QUALITY_INPUTS, NetEase, is_supported_music_quality
+from .api import QUALITY_INPUTS, NetEase, Parse, is_supported_music_quality
 from .config import Config
 from .daemon import (
     is_daemon_running,
@@ -88,9 +88,10 @@ EXAMPLES:
     # QR login split-flow (round 2: after user scanned)
     musicbox auth login --check <unikey> --json
 
-    # List charts and playlist tracks
+    # List charts, playlist tracks and my playlists
     musicbox toplist --json
     musicbox playlist show 3778678 --json
+    musicbox playlist mine --json
 
 AI AGENT SKILLS:
     musicbox pairs with AI agent skills (Cursor, Claude Code, etc.) that
@@ -202,17 +203,18 @@ def _ctx_from_ns(ns: argparse.Namespace) -> CliContext:
     return CliContext(json_mode=ns.json, quiet=ns.quiet)
 
 
-def _require_logged_in(api: NetEase, ctx: CliContext) -> bool:
+def _require_logged_in(api: NetEase, ctx: CliContext) -> dict[str, Any] | None:
+    """Return the account info when logged in; otherwise emit not_logged_in."""
     info = api.get_account_info()
     if info.get("account") or info.get("profile"):
-        return True
+        return info
     ctx.emit_err(
         "not_logged_in",
         "未登录或登录已过期",
         "musicbox auth login --no-wait --json",
         exit_code=EXIT_NOT_LOGGED_IN,
     )
-    return False
+    return None
 
 
 def _on_login_success(api: NetEase, storage: Storage) -> dict[str, Any]:
@@ -357,6 +359,75 @@ def cmd_playlist_show(api: NetEase, ctx: CliContext, args: argparse.Namespace) -
         human,
         notice=_update_notice() if ctx.json_mode else None,
     )
+
+
+# 歌单分类，也是 `playlist mine` 的输出顺序
+PLAYLIST_KINDS = {"liked": "我喜欢", "created": "创建", "subscribed": "收藏"}
+
+
+def _playlist_kind(playlist: dict[str, Any], uid: Any) -> str:
+    if playlist.get("specialType") == 5:
+        return "liked"
+    if (playlist.get("creator") or {}).get("userId") == uid:
+        return "created"
+    return "subscribed"
+
+
+def cmd_playlist_mine(api: NetEase, ctx: CliContext, args: argparse.Namespace) -> int:
+    info = _require_logged_in(api, ctx)
+    if not info:
+        return EXIT_NOT_LOGGED_IN
+    uid = (info.get("account") or {}).get("id") or (info.get("profile") or {}).get(
+        "userId"
+    )
+    raw: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    while True:
+        batch = api.user_playlist(uid, offset=len(raw), limit=1000)
+        new = [pl for pl in batch if pl.get("id") not in seen]
+        if not new:
+            break
+        seen.update(pl["id"] for pl in new)
+        raw.extend(new)
+    order = list(PLAYLIST_KINDS)
+    data = sorted(
+        (
+            {
+                "id": pl["id"],
+                "name": pl.get("name", ""),
+                "kind": _playlist_kind(pl, uid),
+                "track_count": pl.get("trackCount", 0),
+                "creator": (pl.get("creator") or {}).get("nickname", ""),
+            }
+            for pl in raw
+        ),
+        key=lambda pl: order.index(pl["kind"]),
+    )
+    human = (
+        "\n".join(
+            f"{pl['id']}\t[{PLAYLIST_KINDS[pl['kind']]}] {pl['name']}"
+            f"（{pl['track_count']} 首）"
+            for pl in data
+        )
+        or "(无歌单)"
+    )
+    return ctx.emit_ok(data, human)
+
+
+def cmd_recent(api: NetEase, ctx: CliContext, args: argparse.Namespace) -> int:
+    if not _require_logged_in(api, ctx):
+        return EXIT_NOT_LOGGED_IN
+    data = [
+        {
+            "song_id": song["id"],
+            "song_name": song.get("name", ""),
+            "artist": Parse.song_artist(song),
+            "album_name": (song.get("al") or {}).get("name", ""),
+        }
+        for song in api.recent_songs(limit=args.limit)
+    ]
+    human = _format_search_results(data, "song")
+    return ctx.emit_ok(data, human)
 
 
 def cmd_toplist(api: NetEase, ctx: CliContext, args: argparse.Namespace) -> int:
@@ -1105,6 +1176,15 @@ def _build_parser() -> MusicboxArgumentParser:
     p_playlist_show.add_argument("id", type=int, help="歌单 ID")
     p_playlist_show.set_defaults(handler="playlist_show")
 
+    p_playlist_mine = playlist_sub.add_parser(
+        "mine",
+        help="我的歌单：我喜欢的音乐 / 创建的歌单 / 收藏的歌单（需登录）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  musicbox playlist mine --json",
+    )
+    _add_common_flags(p_playlist_mine)
+    p_playlist_mine.set_defaults(handler="playlist_mine")
+
     # toplist
     p_toplist = sub.add_parser(
         "toplist",
@@ -1152,6 +1232,19 @@ def _build_parser() -> MusicboxArgumentParser:
     )
     _add_common_flags(p_fm)
     p_fm.set_defaults(handler="fm")
+
+    # recent
+    p_recent = sub.add_parser(
+        "recent",
+        help="最近播放的歌曲（需登录）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  musicbox recent --limit 50 --json",
+    )
+    _add_common_flags(p_recent)
+    p_recent.add_argument(
+        "--limit", type=int, default=100, help="最多返回几首（接口上限 300）"
+    )
+    p_recent.set_defaults(handler="recent")
 
     # comments
     p_comments = sub.add_parser(
@@ -1530,9 +1623,11 @@ def dispatch(api: NetEase, ns: argparse.Namespace) -> int:
         "song_info": lambda: cmd_song_info(api, ctx, ns),
         "song_url": lambda: cmd_song_url(api, ctx, ns),
         "playlist_show": lambda: cmd_playlist_show(api, ctx, ns),
+        "playlist_mine": lambda: cmd_playlist_mine(api, ctx, ns),
         "toplist": lambda: cmd_toplist(api, ctx, ns),
         "recommend": lambda: cmd_recommend(api, ctx, ns),
         "fm": lambda: cmd_fm(api, ctx, ns),
+        "recent": lambda: cmd_recent(api, ctx, ns),
         "comments": lambda: cmd_comments(api, ctx, ns),
         "like": lambda: cmd_like(api, ctx, ns),
         "auth_status": lambda: cmd_auth_status(api, ctx, ns),

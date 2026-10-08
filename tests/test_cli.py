@@ -295,6 +295,67 @@ def test_recommend_songs_logged_in(monkeypatch, capsys):
     assert payload["ok"] is True
 
 
+class MyPlaylistsNetEase(LoggedInNetEase):
+    """user_playlist 无视 offset、始终返回同一批（模拟接口不分页）。"""
+
+    def user_playlist(self, uid, offset=0, limit=50):
+        def pl(pid, name, creator_id, special=0):
+            return {
+                "id": pid,
+                "name": name,
+                "specialType": special,
+                "trackCount": 3,
+                "creator": {"userId": creator_id, "nickname": f"u{creator_id}"},
+            }
+
+        return [
+            pl(1, "我创建的", 12345),
+            pl(2, "少女终末旅行（原声集）", 999),
+            pl(3, "测试用户喜欢的音乐", 12345, special=5),
+        ]
+
+    def recent_songs(self, limit=100):
+        return [
+            {
+                "id": 393631,
+                "name": "十年所见",
+                "ar": [{"name": "永动机"}],
+                "al": {"name": "The Debut"},
+            }
+        ][:limit]
+
+
+def test_playlist_mine_orders_liked_created_subscribed(monkeypatch, capsys):
+    code = _run(monkeypatch, ["playlist", "mine", "--json"], MyPlaylistsNetEase)
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert [(pl["id"], pl["kind"]) for pl in data] == [
+        (3, "liked"),
+        (1, "created"),
+        (2, "subscribed"),
+    ]
+
+
+def test_playlist_mine_not_logged_in(monkeypatch, capsys):
+    code = _run(monkeypatch, ["playlist", "mine", "--json"])
+    assert code == 3
+    assert json.loads(capsys.readouterr().err)["error"]["type"] == "not_logged_in"
+
+
+def test_recent_songs(monkeypatch, capsys):
+    code = _run(monkeypatch, ["recent", "--json"], MyPlaylistsNetEase)
+    assert code == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data == [
+        {
+            "song_id": 393631,
+            "song_name": "十年所见",
+            "artist": "永动机",
+            "album_name": "The Debut",
+        }
+    ]
+
+
 def test_auth_login_no_wait(monkeypatch, capsys):
     code = _run(monkeypatch, ["auth", "login", "--no-wait", "--json"])
     assert code == 0
