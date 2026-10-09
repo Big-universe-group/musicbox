@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 # Let's make some noise
+import contextlib
 import json
 import os
 import random
@@ -59,6 +60,13 @@ class Player:
     MODE_RANDOM_LOOP = 4
     SUBPROCESS_LIST = []
     MUSIC_THREADS = []
+    # mpg123 stuck in a network read ignores both "Q" and SIGTERM, so quitting
+    # must be bounded and fall back to SIGKILL.
+    MPG123_QUIT_TIMEOUT = 2.0
+    # A playing (not paused) mpg123 that prints nothing for this long is reading
+    # from a dead connection; "--timeout" does not fire in remote (-R) mode.
+    MPG123_STALL_TIMEOUT = 20.0
+    MPG123_WATCH_INTERVAL = 1.0
 
     def __init__(self, ui=None):
         self.config = Config()
@@ -261,8 +269,12 @@ class Player:
             ):
                 self.popen_handler.stdin.write(b"Q\n")
                 self.popen_handler.stdin.flush()
-                self.popen_handler.communicate()
-                self.popen_handler.kill()
+                try:
+                    self.popen_handler.wait(timeout=self.MPG123_QUIT_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    log.warning("mpg123 ignored quit command, killing it")
+                    self.popen_handler.kill()
+                    self.popen_handler.wait()
             elif self.popen_handler.poll() is None:
                 self.popen_handler.terminate()
                 try:
@@ -537,10 +549,32 @@ class Player:
         self.notify_copyright_issue()
         self._advance_on_playback_failure()
 
+    def _watch_mpg123_stall(self, process, token, last_output, stalled):
+        """Kill ``process`` once a playing stream stops producing output.
+
+        ``last_output[0]`` is the monotonic time of the latest mpg123 line, kept
+        fresh by the reader loop. Paused playback is silent by design, so the
+        clock restarts while paused.
+        """
+        while process.poll() is None and self._is_current_playback(token, process):
+            time.sleep(self.MPG123_WATCH_INTERVAL)
+            now = time.monotonic()
+            if not self.playing_flag:
+                last_output[0] = now
+                continue
+            silent = now - last_output[0]
+            if silent > self.MPG123_STALL_TIMEOUT:
+                log.warning("mpg123 silent for %.0fs, killing stalled stream", silent)
+                stalled.set()
+                with contextlib.suppress(OSError):
+                    process.kill()
+                return
+
     def run_mpg123(self, on_exit, url, expires=-1, get_time=-1):
         self.current_backend = "mpg123"
+        token = self.playback_token
         para = ["mpg123", "-R"] + self.config_mpg123
-        self.popen_handler = subprocess.Popen(
+        process = self.popen_handler = subprocess.Popen(
             para, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
 
@@ -548,6 +582,14 @@ class Player:
             self.notify_copyright_issue()
             self._advance_on_playback_failure()
             return
+
+        last_output = [time.monotonic()]
+        stalled = threading.Event()
+        threading.Thread(
+            target=self._watch_mpg123_stall,
+            args=(process, token, last_output, stalled),
+            daemon=True,
+        ).start()
 
         self.tune_volume()
         try:
@@ -576,6 +618,7 @@ class Player:
                 strout = " "
                 break
             else:
+                last_output[0] = time.monotonic()
                 strout_new = stroutlines.decode().strip()
                 if strout_new[:2] != strout[:2]:
                     # if status of mpg123 changed
@@ -633,6 +676,12 @@ class Player:
         #       [1, 0, 1]: self.next()
         #       [1, 1, 0]: self.next()
         #       [1, 1, 1]: self.stop()
+
+        if stalled.is_set():
+            # Killed by the watchdog: the stream died, treat it like a failed track.
+            if self._is_current_playback(token, process):
+                self._advance_on_playback_failure()
+            return
 
         # Do corresponding action according to status
         if self.playing_flag and self.refresh_url_flag:

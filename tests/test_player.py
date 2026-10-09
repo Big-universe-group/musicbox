@@ -1,3 +1,7 @@
+import subprocess
+import sys
+import threading
+import time
 from unittest.mock import PropertyMock, patch
 
 from NEMbox.player import Player
@@ -190,3 +194,98 @@ def test_build_playinfo_rotates_quality_label(monkeypatch):
 
     assert calls[0][0][3] == "LOSSLESS"
     assert calls[1][0][3] == "44.1kHz 16bit"
+
+
+# Stand-in for an mpg123 blocked in a dead network read: ignores stdin ("Q")
+# and SIGTERM, only SIGKILL ends it.
+_STUCK_MPG123 = (
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+)
+
+
+def _stuck_mpg123():
+    return subprocess.Popen(
+        [sys.executable, "-c", _STUCK_MPG123],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def test_stop_kills_mpg123_that_ignores_quit():
+    process = _stuck_mpg123()
+    player = Player.__new__(Player)
+    player.popen_handler = process
+    player.current_backend = "mpg123"
+    player.playback_token = 0
+    player.MPG123_QUIT_TIMEOUT = 0.2
+    try:
+        worker = threading.Thread(target=player.stop, daemon=True)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive(), "stop() hung on an unresponsive mpg123"
+        assert process.poll() is not None
+    finally:
+        process.kill()
+        process.wait()
+
+
+def _watched_player(process, *, playing):
+    player = Player.__new__(Player)
+    player.popen_handler = process
+    player.playback_token = 1
+    player.playing_flag = playing
+    player.MPG123_STALL_TIMEOUT = 0.3
+    player.MPG123_WATCH_INTERVAL = 0.05
+    return player
+
+
+def test_watchdog_kills_silent_playing_mpg123():
+    process = _stuck_mpg123()
+    player = _watched_player(process, playing=True)
+    stalled = threading.Event()
+    try:
+        watcher = threading.Thread(
+            target=player._watch_mpg123_stall,
+            args=(process, 1, [time.monotonic()], stalled),
+            daemon=True,
+        )
+        watcher.start()
+        watcher.join(5)
+        assert stalled.is_set()
+        assert process.wait(timeout=2) is not None
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_watchdog_spares_paused_mpg123_and_restarts_clock_on_resume():
+    process = _stuck_mpg123()
+    player = _watched_player(process, playing=False)
+    stalled = threading.Event()
+    last_output = [time.monotonic() - 10]
+    try:
+        watcher = threading.Thread(
+            target=player._watch_mpg123_stall,
+            args=(process, 1, last_output, stalled),
+            daemon=True,
+        )
+        watcher.start()
+        time.sleep(0.6)
+        assert not stalled.is_set()
+        assert process.poll() is None
+
+        # Resuming must not count the paused time as silence.
+        player.playing_flag = True
+        time.sleep(0.1)
+        assert not stalled.is_set()
+
+        # A newer playback supersedes this process: the watchdog exits quietly.
+        player.playback_token = 2
+        watcher.join(5)
+        assert not watcher.is_alive()
+        assert not stalled.is_set()
+        assert process.poll() is None
+    finally:
+        process.kill()
+        process.wait()
